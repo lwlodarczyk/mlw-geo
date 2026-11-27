@@ -3,6 +3,7 @@ import test from 'node:test';
 import type { Brand, ComparisonEvidenceRow } from '../../src/db/types.ts';
 import { buildGeoReport, CHECK_RULES, rankActions, summariseVisibility } from '../../src/core/geo-report.ts';
 import { auditSite } from '../../src/core/site-audit.ts';
+import { createD1Db } from '../../src/db/d1.ts';
 
 const brand: Brand = {
   id: 'shop', user_id: 'u', domain: 'shop.pl', name: 'Kolorowy Sklep', category: 'książki dla dzieci',
@@ -188,4 +189,34 @@ test('google visibility, competitor ranking and the worked example', async () =>
   // Opens on a sentence or line start, not mid-word, and keeps list lines.
   const listed = `${'Zdanie wstępne numer jeden. '.repeat(20)}Do przedszkola:\n- "Pójdę do przedszkola" (Rival)\n- inna`;
   assert.ok(excerpt(listed, ['rival.pl']).startsWith('… - "Pójdę do przedszkola" (Rival)\n- inna'), excerpt(listed, ['rival.pl']));
+});
+
+test('D1: raw answers and cited URLs for many responses stay under the 100 bound-parameter limit', async () => {
+  const bound: number[] = [];
+  const d1 = createD1Db({
+    prepare: () => ({
+      bind: (...ids: string[]) => {
+        bound.push(ids.length);
+        if (ids.length > 100) throw new Error('too many SQL variables');
+        return { all: async () => ({ results: ids.map((id) => ({ id, raw_response: `odp ${id}`, cited_urls_json: '["katalog.pl"]' })) }) };
+      },
+    }),
+  } as unknown as Parameters<typeof createD1Db>[0]);
+  const ids = Array.from({ length: 150 }, (_, i) => `r${i}`);
+  const raw = await d1.getRawResponses(ids);
+  const cited = await d1.getCitedUrls(ids);
+  assert.equal(Object.keys(raw).length, 150);
+  assert.deepEqual(cited.r149, ['katalog.pl']);
+  assert.ok(bound.every((n) => n <= 90), String(bound));
+});
+
+test('excerpt edge cases: match after newline-only text, \\r and NBSP folded, abbreviations, line start at 0', async () => {
+  const { excerpt } = await import('../../src/core/geo-report.ts');
+  const urls = Array.from({ length: 200 }, (_, i) => `https://x${i}.pl/strona`).join('\n');
+  assert.ok(excerpt(`${'a '.repeat(150)}Rival\n${urls}`, ['rival.pl']).includes('Rival'));
+  assert.equal(excerpt('Linia\r\nDruga\u00a0linia'), 'Linia\nDruga linia');
+  const abbr = `${'Zdanie pierwsze jest długie. '.repeat(10)}Polecam książki wydawnictwa, np. Rival i inne.`;
+  assert.ok(excerpt(abbr, ['rival.pl']).startsWith('… Polecam książki wydawnictwa, np. Rival'), excerpt(abbr, ['rival.pl']));
+  const nl = `${'x'.repeat(100)} ${'y'.repeat(150)}\nPierwsza linia z Rival`;
+  assert.ok(excerpt(nl, ['rival.pl']).startsWith('… Pierwsza linia z Rival'), excerpt(nl, ['rival.pl']));
 });

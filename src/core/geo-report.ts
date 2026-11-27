@@ -427,19 +427,26 @@ export const EXCERPT_CHARS = 600;
  * line breaks are kept so list items stay readable.
  */
 export function excerpt(text: string, terms: string[] = []): string {
-  const clean = text.replace(/[ \t]+/g, ' ').replace(/ *\n\s*/g, '\n').trim();
+  const clean = text.replace(/[^\S\n]+/g, ' ').replace(/ *\n\s*/g, '\n').trim();
   const roots = terms.map((c) => (c.includes('.') && !c.includes(' ') ? c.split('.')[0] : c)).filter((r) => r.length >= 3);
   const lower = clean.toLowerCase();
-  const at = Math.min(...roots.map((r) => lower.indexOf(r.toLowerCase())).filter((i) => i >= 0), Infinity);
+  const hits = roots.map((r) => ({ at: lower.indexOf(r.toLowerCase()), len: r.length })).filter((h) => h.at >= 0).sort((a, b) => a.at - b.at);
+  const hit = hits[0];
   let start = 0;
-  if (at !== Infinity && at >= EXCERPT_CHARS / 3) {
-    const base = Math.max(0, at - EXCERPT_CHARS / 2);
-    const before = clean.slice(base, at);
-    const boundary = Math.max(before.lastIndexOf('\n') + 1, before.lastIndexOf('. ') + 2, before.lastIndexOf('! ') + 2, before.lastIndexOf('? ') + 2);
-    start = boundary >= 2 ? base + boundary : clean.lastIndexOf(' ', at - EXCERPT_CHARS / 3) + 1;
+  if (hit && hit.at >= EXCERPT_CHARS / 3) {
+    const base = Math.max(0, hit.at - EXCERPT_CHARS / 2);
+    const before = clean.slice(base, hit.at);
+    // Last line break or sentence end before the match ("np. " and similar abbreviations do not count).
+    const ends = [...before.matchAll(/\n|(?<!\b(?:np|tj|m\.in|ok|tzw|ul|godz|nr|r|e\.g|i\.e|etc))[.!?] /g)];
+    const last = ends[ends.length - 1];
+    start = last ? base + last.index! + last[0].length : clean.lastIndexOf(' ', hit.at - EXCERPT_CHARS / 3) + 1;
   }
   let end = Math.min(clean.length, start + EXCERPT_CHARS);
-  if (end < clean.length) end = Math.max(clean.lastIndexOf(' ', end), start + 1);
+  if (end < clean.length) {
+    // End on whitespace, never before the matched term.
+    const cut = Math.max(clean.lastIndexOf(' ', end), clean.lastIndexOf('\n', end));
+    end = Math.max(cut, hit ? hit.at + hit.len : start + 1, start + 1);
+  }
   return `${start > 0 ? '… ' : ''}${clean.slice(start, end).trim()}${end < clean.length ? ' …' : ''}`;
 }
 

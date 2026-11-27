@@ -743,12 +743,16 @@ export function createD1Db(d1: D1Database): Db {
     },
 
     async getRawResponses(responseIds: string[]): Promise<Record<string, string>> {
-      if (responseIds.length === 0) return {};
-      const { results } = await d1
-        .prepare(`SELECT id, raw_response FROM prompt_responses WHERE id IN (${responseIds.map(() => '?').join(', ')})`)
-        .bind(...responseIds)
-        .all<{ id: string; raw_response: string }>();
-      return Object.fromEntries((results ?? []).map((r) => [r.id, r.raw_response]));
+      const out: Record<string, string> = {};
+      for (let i = 0; i < responseIds.length; i += 90) { // D1 binds at most 100 parameters
+        const ids = responseIds.slice(i, i + 90);
+        const { results } = await d1
+          .prepare(`SELECT id, raw_response FROM prompt_responses WHERE id IN (${ids.map(() => '?').join(', ')})`)
+          .bind(...ids)
+          .all<{ id: string; raw_response: string }>();
+        for (const r of results ?? []) out[r.id] = r.raw_response;
+      }
+      return out;
     },
 
     async getCitedUrls(responseIds: string[]): Promise<Record<string, string[]>> {
