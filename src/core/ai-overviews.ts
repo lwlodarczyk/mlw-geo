@@ -17,6 +17,7 @@ import {
 } from './openai.js';
 import { brandMarket, type Market } from './market.js';
 import type {
+  OrganicResult,
   Brand,
   Db,
   EnginePromptResult,
@@ -52,6 +53,8 @@ function requireSerpApiKey(env: AiOverviewsEnv): string {
 export interface AiOverviewCompletion {
   text: string;
   citations: string[];
+  // Organic top 10 of the same google.pl response: Google visibility in the SEO report.
+  organic?: OrganicResult[];
 }
 
 interface SerpApiReference {
@@ -69,7 +72,19 @@ interface SerpApiAiOverview {
 
 interface SerpApiResponse {
   ai_overview?: SerpApiAiOverview;
+  organic_results?: Array<{ position?: number; link?: string; title?: string }>;
   error?: string;
+}
+
+export function organicTop10(data: { organic_results?: SerpApiResponse['organic_results'] }): OrganicResult[] {
+  const out: OrganicResult[] = [];
+  for (const r of data.organic_results ?? []) {
+    if (typeof r.link !== 'string' || out.length >= 10) continue;
+    let host: string;
+    try { host = new URL(r.link).hostname.toLowerCase().replace(/^www\./, ''); } catch { continue; }
+    out.push({ position: typeof r.position === 'number' ? r.position : out.length + 1, host, url: r.link, title: (r.title ?? '').slice(0, 200) });
+  }
+  return out;
 }
 
 function completionFromOverview(
@@ -119,14 +134,15 @@ export async function chatCompletion(
     no_cache: 'true',
   });
   const data = await fetchSerpApi(params);
+  const organic = organicTop10(data);
   const overview = data.ai_overview;
   if (!overview) {
-    return { text: NO_AI_OVERVIEW, citations: [] };
+    return { text: NO_AI_OVERVIEW, citations: [], organic };
   }
 
   const direct = completionFromOverview(overview);
   if (hasOverviewContent(direct)) {
-    return direct;
+    return { ...direct, organic };
   }
 
   if (typeof overview.page_token === 'string' && overview.page_token.length > 0) {
@@ -145,10 +161,10 @@ export async function chatCompletion(
     if (!hasOverviewContent(resolved)) {
       throw new Error('SerpAPI AI Overview follow-up returned no usable content');
     }
-    return resolved;
+    return { ...resolved, organic };
   }
 
-  return { text: NO_AI_OVERVIEW, citations: [] };
+  return { text: NO_AI_OVERVIEW, citations: [], organic };
 }
 
 function normalizeHost(rawUrl: string): string | null {
@@ -227,6 +243,7 @@ function buildResultFromPayload(
       brand_cited_with_link: 0,
       cited_urls: [],
       competitors_mentioned: [],
+      organic_results: payload.organic,
       status: 'ok',
     };
   }
@@ -245,6 +262,7 @@ function buildResultFromPayload(
     cited_urls: merged_cited,
     competitors_mentioned: citations.competitors_mentioned,
     engine_citations: payload.citations,
+    organic_results: payload.organic,
     status: 'ok',
   };
 }

@@ -17,7 +17,7 @@ import { mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CURRENT_MARKET_SQL, LIVE_RUN_STALE_AFTER_MS } from './types.js';
+import { CURRENT_MARKET_SQL, LIVE_RUN_STALE_AFTER_MS, type OrganicResult } from './types.js';
 import { brandMarket } from '../core/market.js';
 import type {
   Brand,
@@ -599,8 +599,8 @@ export function openSqliteDb(path?: string): SqliteDb {
           `INSERT INTO prompt_responses
              (id, run_id, prompt_id, engine, raw_response, brand_mentioned,
               brand_cited_with_link, cited_urls_json, competitors_mentioned_json,
-              engine_citations_json, status, error_message, captured_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              engine_citations_json, organic_json, status, error_message, captured_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           randomUUID(),
@@ -615,6 +615,7 @@ export function openSqliteDb(path?: string): SqliteDb {
           input.engine_citations && input.engine_citations.length > 0
             ? JSON.stringify(input.engine_citations)
             : null,
+          input.organic_results && input.organic_results.length > 0 ? JSON.stringify(input.organic_results) : null,
           input.status,
           input.error_message ?? null,
           Date.now(),
@@ -643,8 +644,8 @@ export function openSqliteDb(path?: string): SqliteDb {
         `INSERT INTO prompt_responses
            (id, run_id, prompt_id, engine, raw_response, brand_mentioned,
             brand_cited_with_link, cited_urls_json, competitors_mentioned_json,
-            engine_citations_json, status, error_message, captured_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            engine_citations_json, organic_json, status, error_message, captured_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       const upsertCache = sqlite.prepare(
         `INSERT INTO shared_prompt_cache
@@ -683,6 +684,7 @@ export function openSqliteDb(path?: string): SqliteDb {
             r.engine_citations && r.engine_citations.length > 0
               ? JSON.stringify(r.engine_citations)
               : null,
+            r.organic_results && r.organic_results.length > 0 ? JSON.stringify(r.organic_results) : null,
             r.status,
             r.error_message ?? null,
             now,
@@ -747,7 +749,7 @@ export function openSqliteDb(path?: string): SqliteDb {
           `WITH ranked AS (
              SELECT pr.id, pr.run_id, pr.prompt_id, pr.engine,
                     pr.brand_mentioned, pr.competitors_mentioned_json,
-                    pr.status, pr.captured_at, r.started_at AS run_started_at, r.mode,
+                    pr.organic_json, pr.status, pr.captured_at, r.started_at AS run_started_at, r.mode,
                     ROW_NUMBER() OVER (
                       PARTITION BY pr.run_id, pr.engine, pr.prompt_id
                       ORDER BY pr.captured_at DESC, pr.id DESC
@@ -761,7 +763,7 @@ export function openSqliteDb(path?: string): SqliteDb {
            SELECT ranked.id, ranked.run_id, ranked.prompt_id,
                   p.text AS prompt_text, ranked.engine,
                   ranked.brand_mentioned, ranked.competitors_mentioned_json,
-                  ranked.status, ranked.captured_at, ranked.run_started_at, ranked.mode
+                  ranked.status, ranked.captured_at, ranked.run_started_at, ranked.mode, ranked.organic_json
              FROM ranked
              JOIN prompts p ON p.id = ranked.prompt_id
             WHERE ranked.retry_rank = 1
@@ -770,7 +772,7 @@ export function openSqliteDb(path?: string): SqliteDb {
         .all(brandId, since) as Array<Pick<ResponseJoinRow,
           'id' | 'run_id' | 'prompt_id' | 'prompt_text' | 'engine' |
           'brand_mentioned' | 'competitors_mentioned_json' | 'status' | 'captured_at'> &
-          { run_started_at: number; mode: Run['mode'] }>;
+          { run_started_at: number; mode: Run['mode']; organic_json: string | null }>;
       return rows.map((row) => ({
         id: row.id,
         run_id: row.run_id,
@@ -783,7 +785,16 @@ export function openSqliteDb(path?: string): SqliteDb {
         captured_at: row.captured_at,
         run_started_at: row.run_started_at,
         mode: row.mode,
+        organic_results: row.organic_json ? (JSON.parse(row.organic_json) as OrganicResult[]) : null,
       }));
+    },
+
+    async getRawResponses(responseIds: string[]): Promise<Record<string, string>> {
+      if (responseIds.length === 0) return {};
+      const rows = sqlite
+        .prepare(`SELECT id, raw_response FROM prompt_responses WHERE id IN (${responseIds.map(() => '?').join(', ')})`)
+        .all(...responseIds) as Array<{ id: string; raw_response: string }>;
+      return Object.fromEntries(rows.map((r) => [r.id, r.raw_response]));
     },
 
     async getCitationSourceRows(

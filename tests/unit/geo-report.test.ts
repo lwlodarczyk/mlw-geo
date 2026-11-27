@@ -129,3 +129,26 @@ test('rankActions: top action is always 100, also when all are low', () => {
   const lows = rankActions([{ ...base, id: 'a', severity: 'low', reach: 0.5 }, { ...base, id: 'b', severity: 'low', reach: 0 }]);
   assert.deepEqual(lows.map((x) => x.impact), [100, 75]);
 });
+
+test('google visibility, competitor ranking and the worked example', async () => {
+  const { googleVisibility, pickExample, rankCompetitors, excerpt } = await import('../../src/core/geo-report.ts');
+  const b = { ...brand, competitors: ['rival.pl', 'other.pl'] };
+  const org = (...hosts: string[]) => hosts.map((host, i) => ({ position: i + 1, host, url: `https://${host}/`, title: host }));
+  const rows = [
+    { ...row('ai_overviews', 'p1', 'książki o emocjach', 0), organic_results: org('rival.pl', 'x.pl', 'shop.pl') },
+    { ...row('ai_overviews', 'p2', 'książki dla 5-latka', 0), organic_results: org('y.pl') },
+    row('chatgpt', 'p1', 'książki o emocjach', 0, ['rival.pl', 'other.pl']),
+    row('claude', 'p1', 'książki o emocjach', 0, []),
+    row('gemini', 'p2', 'książki dla 5-latka', 0, ['rival.pl']),
+  ];
+  const g = googleVisibility(b, rows);
+  assert.deepEqual([g.questions, g.shop_top10, g.competitor_top10], [2, 1, { 'rival.pl': 1, 'other.pl': 0 }]);
+  assert.deepEqual(g.prompts.find((p) => p.prompt_id === 'p1')!.competitors, [{ domain: 'rival.pl', position: 1 }]);
+  assert.deepEqual(rankCompetitors(b, rows, g).map((c) => [c.domain, c.ai_mentions]), [['rival.pl', 2], ['other.pl', 1]]);
+  const pick = pickExample(rows, g)!;
+  assert.deepEqual([pick.prompt, pick.withCompetitor.engine, pick.withoutCompetitor.engine], ['książki o emocjach', 'chatgpt', 'claude']);
+  const long = `${'wstęp '.repeat(200)}Polecam Rival i jego serię. ${'koniec '.repeat(200)}`;
+  const e = excerpt(long, ['rival.pl']);
+  assert.ok(e.startsWith('… ') && e.endsWith(' …') && e.includes('Polecam Rival'));
+  assert.equal(excerpt('Krótka odpowiedź.'), 'Krótka odpowiedź.');
+});
