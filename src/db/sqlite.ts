@@ -797,6 +797,18 @@ export function openSqliteDb(path?: string): SqliteDb {
       return Object.fromEntries(rows.map((r) => [r.id, r.raw_response]));
     },
 
+    async getCitedUrls(responseIds: string[]): Promise<Record<string, string[]>> {
+      const out: Record<string, string[]> = {};
+      for (let i = 0; i < responseIds.length; i += 90) {
+        const ids = responseIds.slice(i, i + 90);
+        const rows = sqlite
+          .prepare(`SELECT id, cited_urls_json FROM prompt_responses WHERE id IN (${ids.map(() => '?').join(', ')})`)
+          .all(...ids) as Array<{ id: string; cited_urls_json: string | null }>;
+        for (const r of rows) out[r.id] = parseJsonArray(r.cited_urls_json);
+      }
+      return out;
+    },
+
     async getCitationSourceRows(
       brandId: string,
       since: number,

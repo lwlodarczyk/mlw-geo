@@ -280,6 +280,8 @@ export type ComparisonEvidenceRow = Pick<PromptResponse,
     mode?: Run['mode'] | null;
     // Organic Google top 10, AI Overviews rows captured since migration 0008 only.
     organic_results?: OrganicResult[] | null;
+    // Filled by the GEO report from getCitedUrls, never by the comparison query.
+    cited_urls?: string[];
   };
 
 export interface CitationPageOptions {
@@ -366,6 +368,8 @@ export interface Db {
   getResponsesSince(brandId: string, since: number): Promise<ComparisonEvidenceRow[]>;
   // Full answer text for a few response IDs (report examples); unknown IDs are absent.
   getRawResponses(responseIds: string[]): Promise<Record<string, string>>;
+  // Domains or URLs each answer cites, for a set of response IDs (report source counts).
+  getCitedUrls(responseIds: string[]): Promise<Record<string, string[]>>;
   // All successful observations in the fixed citation window, including
   // unmentioned brand responses. Never restrict this to the current cursor page.
   getCitationSourceRows(

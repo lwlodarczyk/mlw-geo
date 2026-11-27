@@ -22,7 +22,8 @@ const SD = `${G}/appearance/structured-data/intro-structured-data`;
 
 type Rule = { category: string; severity: Severity; effort: number; title: string; fix: string; source: string; heuristic?: boolean };
 
-// One rule per AEO check. llms-txt has none: it weighs 0 (decision 18).
+// One rule per AEO check. llms-txt and rss-feed have none: no evidence that either
+// moves AI answers (decision 18), so they never become an action.
 export const CHECK_RULES: Record<string, Rule> = {
   'ai-bot-access': { category: 'crawl', severity: 'critical', effort: 1, title: 'AI crawlers blocked in robots.txt',
     fix: 'Allow OAI-SearchBot, ChatGPT-User, GPTBot, ClaudeBot and PerplexityBot in robots.txt.',
@@ -61,9 +62,6 @@ export const CHECK_RULES: Record<string, Rule> = {
   'text-depth': { category: 'content', severity: 'medium', effort: 3, title: 'Thin pages (under 250 words)',
     fix: 'Add the substance a buyer asks AI about: who it is for, specifics, answers to common questions.',
     source: `${G}/fundamentals/creating-helpful-content`, heuristic: true },
-  'rss-feed': { category: 'discovery', severity: 'low', effort: 2, title: 'No RSS or Atom feed',
-    fix: 'Publish a feed for the blog or news section and link it with <link rel="alternate">.',
-    source: 'https://www.rssboard.org/rss-specification', heuristic: true },
 };
 
 // A public standard, not a link to this tool: reports must not name the tools that built them.
@@ -147,22 +145,28 @@ function aeoDrafts(audit: Audit): Draft[] {
 
 const lower = (s: Severity): Severity => (s === 'critical' ? 'high' : s === 'high' ? 'medium' : 'low');
 
-function visibilityDrafts({ visibility: v, losing, absent, promptCount }: VisibilitySummary): Draft[] {
+function visibilityDrafts({ visibility: v, losing, absent, promptCount }: VisibilitySummary, sources: Source[] = []): Draft[] {
   if (v.rate === null) return [];
   const out: Draft[] = [];
   const to_verify = v.answers < MIN_ANSWERS || v.per_engine.some((e) => e.answers < MIN_ENGINE_ANSWERS);
   const thin = v.per_engine.filter((e) => e.answers < MIN_ENGINE_ANSWERS || e.answers < e.expected);
   const engines = v.per_engine.map((e) => `${e.engine} ${e.mentioned}/${e.answers}`).join(', ')
-    + (thin.length ? `; to verify: ${thin.map((e) => `${e.engine} answered ${e.answers} of ${e.expected} prompts`).join(', ')}` : '');
-  const sample = `${v.answers} unbranded answers, ${v.runs} runs, ${v.window?.from.slice(0, 10)} to ${v.window?.to.slice(0, 10)}, market ${v.market}`;
+    + (thin.length ? `; to verify: ${thin.map((e) => `${e.engine} answered ${e.answers} of ${e.expected} questions`).join(', ')}` : '');
+  // Newest answer per engine and question: one answer per question from each assistant, not repeated samples.
+  const sample = `${v.answers} answers to ${promptCount} questions that do not name the brand, one per question from each assistant, ${v.window?.from.slice(0, 10)} to ${v.window?.to.slice(0, 10)}, market ${v.market}`;
+  // Third-party pages the assistants cite (catalogues, shops, blogs): where a brand gets recommended.
+  const cited = sources.filter((s) => s.kind === 'other').slice(0, 5).map((s) => s.host);
   if (v.rate < 0.3 && absent.length > 0) {
     out.push({
       id: 'ai_visibility_low', origin: 'visibility', category: 'visibility',
       severity: v.rate < 0.1 ? 'high' : 'medium', effort: 3,
       title: 'Brand missing from AI answers to buyer questions',
-      fix: 'Publish pages that answer these questions directly (category texts, buyer Q&A, specs) and rescan the same prompts after the change.',
+      fix: (cited.length
+        ? `Get the brand and its products listed, reviewed and mentioned on the sites AI assistants cite for these questions, above all ${cited.join(', ')}. `
+        : '')
+        + 'Publish pages that answer these questions directly (category texts, buyer Q&A, specs), then rescan the same questions.',
       source: VISIBILITY_SOURCE, count: absent.length,
-      evidence: `Mentioned in ${v.mentioned} of ${v.answers} answers (${Math.round(v.rate * 100)} %; ${engines}); ${absent.length} prompts with no mention on any engine. Sample: ${sample}.`,
+      evidence: `Mentioned in ${v.mentioned} of ${v.answers} answers (${Math.round(v.rate * 100)} %; ${engines}); ${absent.length} questions with no mention from any assistant. Sample: ${sample}.`,
       heuristic: false, to_verify, urls: [], prompts: absent, reach: absent.length / promptCount,
     });
   }
@@ -172,10 +176,10 @@ function visibilityDrafts({ visibility: v, losing, absent, promptCount }: Visibi
     const top = [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 5).map(([c, n]) => `${c} (${n})`);
     out.push({
       id: 'competitors_preferred', origin: 'visibility', category: 'visibility', severity: 'medium', effort: 3,
-      title: 'AI engines name competitors instead of the brand',
-      fix: 'Compare the cited competitor pages with yours and close the gaps on the matching category and product pages.',
+      title: 'AI assistants name competitors instead of the brand',
+      fix: 'For each question, compare what the assistants say about the named competitor with your matching category or product page, and close the gap in what the page states (audience, topic, format, proof).',
       source: VISIBILITY_SOURCE, count: losing.length,
-      evidence: `${losing.length} prompts where an answer names a competitor but not the brand. Most named: ${top.join(', ')}. Sample: ${sample}.`,
+      evidence: `${losing.length} questions where an answer names a competitor but not the brand. Most named: ${top.join(', ')}. Sample: ${sample}.`,
       heuristic: false, to_verify, urls: [], prompts: losing.map((l) => l.prompt), reach: losing.length / promptCount,
     });
   }
@@ -212,16 +216,19 @@ export function summariseVisibility(brand: Brand, rows: ComparisonEvidenceRow[],
   const branded = new Set<string>();
   const unbranded = new Set<string>();
   const latest = new Map<string, ComparisonEvidenceRow>(); // engine+prompt -> newest ok row
+  const latestBranded = new Map<string, ComparisonEvidenceRow>(); // same, for questions that name the brand
   for (const r of rows) {
     if (r.status !== 'ok' || !activePromptIds.has(r.prompt_id)) continue;
     if (brand.identity_changed_at && (r.run_started_at ?? r.captured_at) < brand.identity_changed_at) continue;
-    if (names(r.prompt_text)) { branded.add(r.prompt_id); continue; }
-    unbranded.add(r.prompt_id);
+    const isBranded = names(r.prompt_text);
+    (isBranded ? branded : unbranded).add(r.prompt_id);
+    const into = isBranded ? latestBranded : latest;
     const key = `${r.engine}\u0000${r.prompt_id}`;
-    const prev = latest.get(key);
-    if (!prev || r.captured_at > prev.captured_at) latest.set(key, r);
+    const prev = into.get(key);
+    if (!prev || r.captured_at > prev.captured_at) into.set(key, r);
   }
   const used = [...latest.values()];
+  const brandedUsed = [...latestBranded.values()];
   const per_engine: EngineVisibility[] = [...new Set(used.map((r) => r.engine))].sort().map((engine) => {
     const e = used.filter((r) => r.engine === engine);
     const mentioned = e.filter((r) => r.brand_mentioned === 1).length;
@@ -247,18 +254,19 @@ export function summariseVisibility(brand: Brand, rows: ComparisonEvidenceRow[],
   const prompts = [...byPrompt.values()].sort((a, b) => a.prompt.localeCompare(b.prompt));
   const absent = prompts.filter((p) => !p.hit).map((p) => p.prompt);
   const losing = prompts.filter((p) => p.competitors.size > 0).map((p) => ({ prompt: p.prompt, competitors: [...p.competitors].sort() }));
-  return { visibility, absent, losing, promptCount: prompts.length, used };
+  return { visibility, absent, losing, promptCount: prompts.length, used, brandedUsed };
 }
 export type VisibilitySummary = ReturnType<typeof summariseVisibility>;
 
 export function buildGeoReport(brand: Brand, audit: Audit, vis: VisibilitySummary & Partial<Awaited<ReturnType<typeof collectVisibility>>>, version: string) {
   const { visibility } = vis;
-  const actions = rankActions([...aeoDrafts(audit), ...visibilityDrafts(vis)]);
+  const sources = vis.sources ?? sourcesOf(brand, vis.used);
+  const actions = rankActions([...aeoDrafts(audit), ...visibilityDrafts(vis, sources)]);
   return {
     schema_version: '1.0',
     tool: { name: 'mlw-geo', version },
     run: { generated_at: audit.generatedAt, options: { brand_id: brand.id, max_pages: audit.maxPages }, crawl_ms: audit.diagnostics.crawlMs },
-    site: { domain: brand.domain, url: audit.url, market: visibility.market, google_domain: visibility.google_domain,
+    site: { domain: brand.domain, brand_name: brand.name, brand_aliases: brand.aliases, url: audit.url, market: visibility.market, google_domain: visibility.google_domain,
       crawled_pages: audit.crawledPages, page_types: audit.pageTypes, robots: audit.robots, llms_txt: audit.llmsTxt },
     scores: {
       categories: { aeo: audit.foundationalScore, ai_visibility: visibility.rate === null ? null : Math.round(visibility.rate * 100) },
@@ -278,6 +286,9 @@ export function buildGeoReport(brand: Brand, audit: Audit, vis: VisibilitySummar
     google: vis.google ?? null,
     competitors: vis.competitors ?? null,
     example: vis.example ?? null,
+    // Pages the assistants cite in answers to the same questions, and what they say when asked about the brand by name.
+    sources,
+    brand_answers: vis.brand_answers ?? null,
     pages_for_review: audit.pagesForReview,
   };
 }
@@ -290,13 +301,64 @@ export async function collectVisibility(db: Db, brand: Brand, now = Date.now()) 
   const vis = summariseVisibility(brand, rows, new Set(active.map((p) => p.id)));
   const google = googleVisibility(brand, vis.used);
   const pick = pickExample(vis.used, google);
-  const raw = pick ? await db.getRawResponses([pick.withCompetitor.id, pick.withoutCompetitor.id]) : {};
-  return { ...vis, google, competitors: rankCompetitors(brand, vis.used, google), example: pick ? exampleOf(pick, raw) : null };
+  const ids = [...(pick ? [pick.withCompetitor.id, pick.withoutCompetitor.id] : []), ...vis.brandedUsed.map((r) => r.id)];
+  const [raw, cited] = await Promise.all([
+    ids.length ? db.getRawResponses(ids) : Promise.resolve({} as Record<string, string>),
+    db.getCitedUrls([...vis.used, ...vis.brandedUsed].map((r) => r.id)),
+  ]);
+  for (const r of [...vis.used, ...vis.brandedUsed]) r.cited_urls = cited[r.id] ?? [];
+  return {
+    ...vis, google, competitors: rankCompetitors(brand, vis.used, google), example: pick ? exampleOf(pick, raw) : null,
+    sources: sourcesOf(brand, vis.used), brand_answers: brandAnswersOf(brand, vis.brandedUsed, raw),
+  };
 }
 
 // ─── Google visibility, competitors, worked example (SEO + GEO client reports) ──
 
 const sameSite = (host: string, domain: string) => host === domain || host.endsWith(`.${domain}`);
+const hostOf = (u: string): string | null => {
+  try {
+    return new URL(u.includes('://') ? u : `https://${u}`).hostname.replace(/^www\./, '').toLowerCase() || null;
+  } catch {
+    return null;
+  }
+};
+
+export type Source = { host: string; answers: number; engines: Record<string, number>; kind: 'shop' | 'competitor' | 'other' };
+
+/**
+ * Domains the assistants cite in their answers to the unbranded questions,
+ * counted once per answer. A competitor is a tracked rival brand; everything
+ * else (catalogues, shops, blogs, video) is a source the brand can work with.
+ */
+export function sourcesOf(brand: Brand, used: ComparisonEvidenceRow[], limit = 15): Source[] {
+  const by = new Map<string, Source>();
+  for (const r of used) {
+    for (const host of new Set((r.cited_urls ?? []).map(hostOf).filter((h): h is string => !!h))) {
+      const kind: Source['kind'] = sameSite(host, brand.domain) ? 'shop' : brand.competitors.some((c) => sameSite(host, c)) ? 'competitor' : 'other';
+      const s = by.get(host) ?? { host, answers: 0, engines: {}, kind };
+      s.answers += 1;
+      s.engines[r.engine] = (s.engines[r.engine] ?? 0) + 1;
+      by.set(host, s);
+    }
+  }
+  return [...by.values()].sort((a, b) => b.answers - a.answers || a.host.localeCompare(b.host)).slice(0, limit);
+}
+
+/** What each assistant answered to the questions that name the brand: reputation and facts, not discovery. */
+export function brandAnswersOf(brand: Brand, rows: ComparisonEvidenceRow[], raw: Record<string, string>) {
+  const byPrompt = new Map<string, { prompt: string; answers: { engine: string; captured_at: string; named: boolean; sources: string[]; excerpt: string }[] }>();
+  for (const r of [...rows].sort((a, b) => a.prompt_text.localeCompare(b.prompt_text) || a.engine.localeCompare(b.engine))) {
+    const p = byPrompt.get(r.prompt_id) ?? { prompt: r.prompt_text, answers: [] };
+    p.answers.push({
+      engine: r.engine, captured_at: new Date(r.captured_at).toISOString(), named: r.brand_mentioned === 1,
+      sources: [...new Set((r.cited_urls ?? []).map(hostOf).filter((h): h is string => !!h))].slice(0, 5),
+      excerpt: excerpt(raw[r.id] ?? '', [brand.name, ...brand.aliases]),
+    });
+    byPrompt.set(r.prompt_id, p);
+  }
+  return [...byPrompt.values()];
+}
 
 /**
  * Organic top 10 per buyer question, from the google.pl response the AI
@@ -359,15 +421,33 @@ export function pickExample(used: ComparisonEvidenceRow[], google: ReturnType<ty
 
 export const EXCERPT_CHARS = 600;
 
-/** Excerpt around the first named competitor (its domain root, e.g. "zakamarki"), or the answer start. */
-export function excerpt(text: string, competitors: string[] = []): string {
-  const clean = text.replace(/\s+/g, ' ').trim();
-  const roots = competitors.map((c) => c.split('.')[0]).filter((r) => r.length >= 3);
+/**
+ * Excerpt around the first matching term (a domain counts by its root, e.g. "zakamarki"),
+ * or the answer start. It opens on a sentence or line start and ends on a word boundary;
+ * line breaks are kept so list items stay readable.
+ */
+export function excerpt(text: string, terms: string[] = []): string {
+  const clean = text.replace(/[^\S\n]+/g, ' ').replace(/ *\n\s*/g, '\n').trim();
+  const roots = terms.map((c) => (c.includes('.') && !c.includes(' ') ? c.split('.')[0] : c)).filter((r) => r.length >= 3);
   const lower = clean.toLowerCase();
-  const at = Math.min(...roots.map((r) => lower.indexOf(r.toLowerCase())).filter((i) => i >= 0), Infinity);
-  const start = at === Infinity || at < EXCERPT_CHARS / 3 ? 0 : clean.lastIndexOf(' ', at - EXCERPT_CHARS / 3) + 1;
-  const body = clean.slice(start, start + EXCERPT_CHARS);
-  return `${start > 0 ? '… ' : ''}${body}${start + EXCERPT_CHARS < clean.length ? ' …' : ''}`;
+  const hits = roots.map((r) => ({ at: lower.indexOf(r.toLowerCase()), len: r.length })).filter((h) => h.at >= 0).sort((a, b) => a.at - b.at);
+  const hit = hits[0];
+  let start = 0;
+  if (hit && hit.at >= EXCERPT_CHARS / 3) {
+    const base = Math.max(0, hit.at - EXCERPT_CHARS / 2);
+    const before = clean.slice(base, hit.at);
+    // Last line break or sentence end before the match ("np. " and similar abbreviations do not count).
+    const ends = [...before.matchAll(/\n|(?<!\b(?:np|tj|m\.in|ok|tzw|ul|godz|nr|r|e\.g|i\.e|etc))[.!?] /g)];
+    const last = ends[ends.length - 1];
+    start = last ? base + last.index! + last[0].length : clean.lastIndexOf(' ', hit.at - EXCERPT_CHARS / 3) + 1;
+  }
+  let end = Math.min(clean.length, start + EXCERPT_CHARS);
+  if (end < clean.length) {
+    // End on whitespace, never before the matched term.
+    const cut = Math.max(clean.lastIndexOf(' ', end), clean.lastIndexOf('\n', end));
+    end = Math.max(cut, hit ? hit.at + hit.len : start + 1, start + 1);
+  }
+  return `${start > 0 ? '… ' : ''}${clean.slice(start, end).trim()}${end < clean.length ? ' …' : ''}`;
 }
 
 function exampleOf(pick: NonNullable<ReturnType<typeof pickExample>>, raw: Record<string, string>) {
