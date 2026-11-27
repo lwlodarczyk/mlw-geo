@@ -247,11 +247,11 @@ export function summariseVisibility(brand: Brand, rows: ComparisonEvidenceRow[],
   const prompts = [...byPrompt.values()].sort((a, b) => a.prompt.localeCompare(b.prompt));
   const absent = prompts.filter((p) => !p.hit).map((p) => p.prompt);
   const losing = prompts.filter((p) => p.competitors.size > 0).map((p) => ({ prompt: p.prompt, competitors: [...p.competitors].sort() }));
-  return { visibility, absent, losing, promptCount: prompts.length };
+  return { visibility, absent, losing, promptCount: prompts.length, used };
 }
 export type VisibilitySummary = ReturnType<typeof summariseVisibility>;
 
-export function buildGeoReport(brand: Brand, audit: Audit, vis: VisibilitySummary, version: string) {
+export function buildGeoReport(brand: Brand, audit: Audit, vis: VisibilitySummary & Partial<Awaited<ReturnType<typeof collectVisibility>>>, version: string) {
   const { visibility } = vis;
   const actions = rankActions([...aeoDrafts(audit), ...visibilityDrafts(vis)]);
   return {
@@ -274,6 +274,10 @@ export function buildGeoReport(brand: Brand, audit: Audit, vis: VisibilitySummar
     },
     visibility,
     actions,
+    // For the client reports: Google top 10 per question, competitors ranked, one worked example.
+    google: vis.google ?? null,
+    competitors: vis.competitors ?? null,
+    example: vis.example ?? null,
     pages_for_review: audit.pagesForReview,
   };
 }
@@ -283,7 +287,95 @@ export async function collectVisibility(db: Db, brand: Brand, now = Date.now()) 
     db.getResponsesSince(brand.id, now - WINDOW_DAYS * 86_400_000),
     db.getActivePrompts(brand.id),
   ]);
-  return summariseVisibility(brand, rows, new Set(active.map((p) => p.id)));
+  const vis = summariseVisibility(brand, rows, new Set(active.map((p) => p.id)));
+  const google = googleVisibility(brand, vis.used);
+  const pick = pickExample(vis.used, google);
+  const raw = pick ? await db.getRawResponses([pick.withCompetitor.id, pick.withoutCompetitor.id]) : {};
+  return { ...vis, google, competitors: rankCompetitors(brand, vis.used, google), example: pick ? exampleOf(pick, raw) : null };
+}
+
+// ─── Google visibility, competitors, worked example (SEO + GEO client reports) ──
+
+const sameSite = (host: string, domain: string) => host === domain || host.endsWith(`.${domain}`);
+
+/**
+ * Organic top 10 per buyer question, from the google.pl response the AI
+ * Overviews engine already fetched (newest row per question). The SEO report
+ * turns it into its Google visibility area; mlw-geo makes no actions from it.
+ */
+export function googleVisibility(brand: Brand, used: ComparisonEvidenceRow[]) {
+  const rows = used.filter((r) => r.engine === 'ai_overviews' && r.organic_results);
+  const prompts = rows.map((r) => {
+    const organic = r.organic_results ?? [];
+    const shop = organic.find((o) => sameSite(o.host, brand.domain));
+    return {
+      prompt_id: r.prompt_id, prompt: r.prompt_text, captured_at: new Date(r.captured_at).toISOString(),
+      shop_position: shop?.position ?? null,
+      competitors: brand.competitors.flatMap((c) => {
+        const hit = organic.find((o) => sameSite(o.host, c));
+        return hit ? [{ domain: c, position: hit.position }] : [];
+      }),
+      top: organic.slice(0, 10),
+    };
+  }).sort((a, b) => a.prompt.localeCompare(b.prompt));
+  const competitorTop10 = Object.fromEntries(brand.competitors.map((c) => [c, prompts.filter((p) => p.competitors.some((x) => x.domain === c)).length]));
+  return {
+    questions: prompts.length,
+    shop_top10: prompts.filter((p) => p.shop_position !== null).length,
+    competitor_top10: competitorTop10,
+    google_domain: brandMarket(brand).google_domain,
+    prompts,
+  };
+}
+
+/** Competitors ranked by AI mentions, then Google top 10 presence; the reports use the top 3. */
+export function rankCompetitors(brand: Brand, used: ComparisonEvidenceRow[], google: ReturnType<typeof googleVisibility>) {
+  return brand.competitors
+    .map((domain) => ({ domain, ai_mentions: used.filter((r) => r.competitors_mentioned.includes(domain)).length, google_top10: google.competitor_top10[domain] ?? 0 }))
+    .sort((a, b) => b.ai_mentions - a.ai_mentions || b.google_top10 - a.google_top10 || a.domain.localeCompare(b.domain));
+}
+
+/**
+ * One question for both reports: a competitor is in Google's top 10, one AI
+ * assistant names a competitor and another names nobody (neither brand nor
+ * competitor). Most competitors named wins; ties by question text, so a
+ * re-audit picks the same question while it still fits.
+ */
+export function pickExample(used: ComparisonEvidenceRow[], google: ReturnType<typeof googleVisibility>) {
+  let best: { prompt: string; google: (typeof google.prompts)[number]; withCompetitor: ComparisonEvidenceRow; withoutCompetitor: ComparisonEvidenceRow } | null = null;
+  for (const g of google.prompts) {
+    if (g.competitors.length === 0) continue;
+    const answers = used.filter((r) => r.prompt_id === g.prompt_id && r.engine !== 'ai_overviews');
+    const withC = answers.filter((r) => r.competitors_mentioned.length > 0).sort((a, b) => b.competitors_mentioned.length - a.competitors_mentioned.length || a.engine.localeCompare(b.engine))[0];
+    const without = answers.filter((r) => r.competitors_mentioned.length === 0 && r.brand_mentioned === 0 && r.engine !== withC?.engine).sort((a, b) => a.engine.localeCompare(b.engine))[0];
+    if (!withC || !without) continue;
+    if (!best || withC.competitors_mentioned.length > best.withCompetitor.competitors_mentioned.length
+      || (withC.competitors_mentioned.length === best.withCompetitor.competitors_mentioned.length && g.prompt.localeCompare(best.prompt) < 0)) {
+      best = { prompt: g.prompt, google: g, withCompetitor: withC, withoutCompetitor: without };
+    }
+  }
+  return best;
+}
+
+export const EXCERPT_CHARS = 600;
+
+/** Excerpt around the first named competitor (its domain root, e.g. "zakamarki"), or the answer start. */
+export function excerpt(text: string, competitors: string[] = []): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  const roots = competitors.map((c) => c.split('.')[0]).filter((r) => r.length >= 3);
+  const lower = clean.toLowerCase();
+  const at = Math.min(...roots.map((r) => lower.indexOf(r.toLowerCase())).filter((i) => i >= 0), Infinity);
+  const start = at === Infinity || at < EXCERPT_CHARS / 3 ? 0 : clean.lastIndexOf(' ', at - EXCERPT_CHARS / 3) + 1;
+  const body = clean.slice(start, start + EXCERPT_CHARS);
+  return `${start > 0 ? '… ' : ''}${body}${start + EXCERPT_CHARS < clean.length ? ' …' : ''}`;
+}
+
+function exampleOf(pick: NonNullable<ReturnType<typeof pickExample>>, raw: Record<string, string>) {
+  const answer = (r: ComparisonEvidenceRow) => ({
+    engine: r.engine, captured_at: new Date(r.captured_at).toISOString(), competitors: r.competitors_mentioned,
+    excerpt: excerpt(raw[r.id] ?? '', r.competitors_mentioned),
+  });
+  return { prompt: pick.prompt, google: pick.google, with_competitor: answer(pick.withCompetitor), without_competitor: answer(pick.withoutCompetitor) };
 }
 
 export function registerGeoReportTool(server: McpServer, db: Db, f: typeof fetch, version: string): void {

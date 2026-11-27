@@ -100,6 +100,14 @@ export interface CachedResponse {
   expires_at: number;
 }
 
+// One organic Google result (AI Overviews engine only): top 10, in order.
+export interface OrganicResult {
+  position: number;
+  host: string;
+  url: string;
+  title: string;
+}
+
 export interface InsertPromptResponseInput {
   run_id: string;
   prompt_id: string;
@@ -110,6 +118,7 @@ export interface InsertPromptResponseInput {
   cited_urls: string[];
   competitors_mentioned: string[];
   engine_citations?: string[];
+  organic_results?: OrganicResult[];
   status: ResponseStatus;
   error_message?: string | null;
 }
@@ -125,6 +134,7 @@ export interface EnginePromptResult {
   cited_urls: string[];
   competitors_mentioned: string[];
   engine_citations?: string[];
+  organic_results?: OrganicResult[];
   status: ResponseStatus;
   error_message?: string | null;
   cache_to_put?: { prompt_hash: string; raw_response: string };
@@ -268,6 +278,8 @@ export type ComparisonEvidenceRow = Pick<PromptResponse,
     run_started_at?: number;
     // Stored live/batch request mode, not inferred from the response body.
     mode?: Run['mode'] | null;
+    // Organic Google top 10, AI Overviews rows captured since migration 0008 only.
+    organic_results?: OrganicResult[] | null;
   };
 
 export interface CitationPageOptions {
@@ -352,6 +364,8 @@ export interface Db {
   // Latest successful response per run/engine/prompt in the comparison window;
   // preserve tie-break identity/timestamps without fetching provider bodies.
   getResponsesSince(brandId: string, since: number): Promise<ComparisonEvidenceRow[]>;
+  // Full answer text for a few response IDs (report examples); unknown IDs are absent.
+  getRawResponses(responseIds: string[]): Promise<Record<string, string>>;
   // All successful observations in the fixed citation window, including
   // unmentioned brand responses. Never restrict this to the current cursor page.
   getCitationSourceRows(

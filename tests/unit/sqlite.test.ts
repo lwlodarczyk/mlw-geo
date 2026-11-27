@@ -27,6 +27,7 @@ const EXPECTED_MIGRATIONS = [
   '0005_brand_alias_exclude.sql',
   '0006_brand_identity_boundary.sql',
   '0007_brand_market.sql',
+  '0008_organic_results.sql',
 ];
 
 function tempRoot(): string {

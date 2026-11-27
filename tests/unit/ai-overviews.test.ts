@@ -231,6 +231,7 @@ test('AI Overview ignores reference-only results with no page token', async () =
       assert.deepEqual(await chatCompletion('test-key', 'Acme'), {
         text: NO_AI_OVERVIEW,
         citations: [],
+        organic: [],
       });
       assert.equal(calls.length, 1);
     },
@@ -271,10 +272,18 @@ test('AI Overview page-token follow-up failures throw', async () => {
 
 test('Google results without an AI Overview return the no-overview sentinel', async () => {
   await withMockFetch(
-    [jsonResponse({ organic_results: [] })],
+    [jsonResponse({ organic_results: [
+      { position: 1, link: 'https://www.rival.pl/a', title: 'Rival' },
+      { position: 2, link: 'not a url' },
+      { position: 3, link: 'https://acme.com/', title: 'Acme' },
+    ] })],
     async (calls) => {
       const result = await chatCompletion('test-key', 'What is Acme?');
-      assert.deepEqual(result, { text: NO_AI_OVERVIEW, citations: [] });
+      // Organic top 10 is kept even when no AI Overview triggers (Google visibility).
+      assert.deepEqual(result, { text: NO_AI_OVERVIEW, citations: [], organic: [
+        { position: 1, host: 'rival.pl', url: 'https://www.rival.pl/a', title: 'Rival' },
+        { position: 3, host: 'acme.com', url: 'https://acme.com/', title: 'Acme' },
+      ] });
       assert.equal(calls.length, 1);
     },
   );
