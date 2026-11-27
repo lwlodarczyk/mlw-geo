@@ -28,9 +28,9 @@ async function audit(robots = 'User-agent: GPTBot\nDisallow: /\n\nSitemap: https
   return auditSite((async (u: string) => (site[u] ? new Response(site[u]) : new Response('', { status: 404 }))) as typeof fetch, 'shop.pl', 5);
 }
 
-test('every scored AEO check has a rule; llms.txt has none (0 points)', async () => {
+test('every scored AEO check has a rule; llms.txt (0 points) and rss-feed never become actions', async () => {
   const r = await audit();
-  for (const c of r.checks) assert.equal(c.id in CHECK_RULES, c.points > 0, c.id);
+  for (const c of r.checks) assert.equal(c.id in CHECK_RULES, c.points > 0 && c.id !== 'rss-feed', c.id);
 });
 
 test('site checks list failing pages', async () => {
@@ -107,11 +107,45 @@ test('report: jev-seo shape, GEO-### ranked by jev-seo rules, no overall score',
   assert.deepEqual(r.actions.map((a) => a.action_id), r.actions.map((_, i) => `GEO-${String(i + 1).padStart(3, '0')}`));
   const low = r.actions.find((a) => a.id === 'ai_visibility_low')!;
   assert.equal(low.to_verify, true, 'under 20 answers');
-  assert.match(low.evidence, /to verify: chatgpt answered 2 of 2 prompts/);
+  assert.match(low.evidence, /to verify: chatgpt answered 2 of 2 questions/);
   assert.deepEqual(low.prompts, ['książki dla 5-latka', 'książki o emocjach']);
   assert.equal(r.actions.find((a) => a.id === 'competitors_preferred')!.count, 1);
-  assert.ok(!r.actions.some((a) => a.id === 'llms-txt'));
+  assert.ok(!r.actions.some((a) => a.id === 'llms-txt' || a.id === 'rss-feed'));
+  assert.match(low.evidence, /Sample: 2 answers to 2 questions that do not name the brand, one per question from each assistant/);
   for (const a of r.actions) assert.equal(a.status, 'to_do');
+});
+
+test('sources: cited domains counted once per answer, competitors and the shop told apart; fix names the top sources', async () => {
+  const { sourcesOf } = await import('../../src/core/geo-report.ts');
+  const rows = [
+    { ...row('chatgpt', 'p1', 'książki o emocjach', 0, ['rival.pl']), cited_urls: ['https://www.katalog.pl/a', 'katalog.pl', 'rival.pl'] },
+    { ...row('gemini', 'p1', 'książki o emocjach', 0), cited_urls: ['https://katalog.pl/b', 'https://shop.pl/x'] },
+    { ...row('claude', 'p2', 'książki dla 5-latka', 0), cited_urls: ['not a url ::'] },
+  ];
+  const s = sourcesOf(brand, rows);
+  assert.deepEqual(s.map((x) => [x.host, x.answers, x.kind]), [['katalog.pl', 2, 'other'], ['rival.pl', 1, 'competitor'], ['shop.pl', 1, 'shop']]);
+  assert.deepEqual(s[0].engines, { chatgpt: 1, gemini: 1 });
+  const r = buildGeoReport(brand, await audit(), summariseVisibility(brand, rows, all(rows)), '0.0.0');
+  assert.match(r.actions.find((a) => a.id === 'ai_visibility_low')!.fix, /above all katalog\.pl\./);
+  assert.equal(r.sources.length, 3);
+});
+
+test('brand answers: questions naming the brand are kept apart, newest answer per assistant, excerpt around the name', async () => {
+  const { brandAnswersOf } = await import('../../src/core/geo-report.ts');
+  const rows = [
+    row('chatgpt', 'p1', 'książki o emocjach', 0),
+    row('chatgpt', 'p3', 'czy Kolorowy Sklep jest dobry', 0, [], 1),
+    { ...row('chatgpt', 'p3', 'czy Kolorowy Sklep jest dobry', 1, [], 2), cited_urls: ['https://katalog.pl/wydawnictwo/kolorowy'] },
+    row('claude', 'p3', 'czy Kolorowy Sklep jest dobry', 0, [], 3),
+  ];
+  const v = summariseVisibility(brand, rows, all(rows));
+  assert.equal(v.visibility.answers, 1, 'branded question not in the rate');
+  assert.deepEqual(v.brandedUsed.map((r) => [r.engine, r.captured_at]).sort(), [['chatgpt', 2], ['claude', 3]]);
+  const raw = Object.fromEntries(v.brandedUsed.map((r) => [r.id, `${'Wstęp. '.repeat(80)}Kolorowy Sklep wydaje książki o emocjach. Koniec.`]));
+  const [p] = brandAnswersOf(brand, v.brandedUsed, raw);
+  assert.equal(p.prompt, 'czy Kolorowy Sklep jest dobry');
+  assert.deepEqual(p.answers.map((a) => [a.engine, a.named, a.sources]), [['chatgpt', true, ['katalog.pl']], ['claude', false, []]]);
+  assert.ok(p.answers[0].excerpt.startsWith('… Kolorowy Sklep wydaje'), p.answers[0].excerpt);
 });
 
 test('report: no scan in market means no visibility actions and a null score with the reason', async () => {
@@ -151,4 +185,7 @@ test('google visibility, competitor ranking and the worked example', async () =>
   const e = excerpt(long, ['rival.pl']);
   assert.ok(e.startsWith('… ') && e.endsWith(' …') && e.includes('Polecam Rival'));
   assert.equal(excerpt('Krótka odpowiedź.'), 'Krótka odpowiedź.');
+  // Opens on a sentence or line start, not mid-word, and keeps list lines.
+  const listed = `${'Zdanie wstępne numer jeden. '.repeat(20)}Do przedszkola:\n- "Pójdę do przedszkola" (Rival)\n- inna`;
+  assert.ok(excerpt(listed, ['rival.pl']).startsWith('… - "Pójdę do przedszkola" (Rival)\n- inna'), excerpt(listed, ['rival.pl']));
 });
