@@ -66,7 +66,8 @@ export const CHECK_RULES: Record<string, Rule> = {
     source: 'https://www.rssboard.org/rss-specification', heuristic: true },
 };
 
-const VISIBILITY_SOURCE = 'https://github.com/AKzar1el/mcp-geo/blob/main/docs/ai-visibility-audit-methodology.md';
+// A public standard, not a link to this tool: reports must not name the tools that built them.
+const VISIBILITY_SOURCE = 'https://developers.google.com/search/docs/appearance/ai-features';
 // Fewer answers than this per report = a rate too noisy to act on without a rerun.
 export const MIN_ANSWERS = 20;
 // Fewer answers than this on one engine = that engine's rate is flagged in the evidence.
@@ -172,7 +173,7 @@ function visibilityDrafts({ visibility: v, losing, absent, promptCount }: Visibi
     out.push({
       id: 'competitors_preferred', origin: 'visibility', category: 'visibility', severity: 'medium', effort: 3,
       title: 'AI engines name competitors instead of the brand',
-      fix: 'Compare the cited competitor pages with yours (get_content_gaps) and close the gaps on the matching category and product pages.',
+      fix: 'Compare the cited competitor pages with yours and close the gaps on the matching category and product pages.',
       source: VISIBILITY_SOURCE, count: losing.length,
       evidence: `${losing.length} prompts where an answer names a competitor but not the brand. Most named: ${top.join(', ')}. Sample: ${sample}.`,
       heuristic: false, to_verify, urls: [], prompts: losing.map((l) => l.prompt), reach: losing.length / promptCount,
