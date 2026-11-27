@@ -7,8 +7,7 @@
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import type { Brand, Db, PromptResponse } from '../db/types.js';
-import { ALL_ENGINES } from './engines.js';
+import type { Brand, ComparisonEvidenceRow, Db } from '../db/types.js';
 import { brandMarket } from './market.js';
 import { findTermSetMatchIndex } from './openai.js';
 import { auditSite, MAX_CRAWL_LIMIT, type SiteCheck } from './site-audit.js';
@@ -26,7 +25,7 @@ type Rule = { category: string; severity: Severity; effort: number; title: strin
 // One rule per AEO check. llms-txt has none: it weighs 0 (decision 18).
 export const CHECK_RULES: Record<string, Rule> = {
   'ai-bot-access': { category: 'crawl', severity: 'critical', effort: 1, title: 'AI crawlers blocked in robots.txt',
-    fix: 'Allow GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot, PerplexityBot and Google-Extended in robots.txt.',
+    fix: 'Allow OAI-SearchBot, ChatGPT-User, GPTBot, ClaudeBot and PerplexityBot in robots.txt.',
     source: 'https://platform.openai.com/docs/bots' },
   indexability: { category: 'crawl', severity: 'high', effort: 1, title: 'Pages marked noindex',
     fix: 'Remove noindex from pages meant to be found; keep it on login, basket and account pages.',
@@ -70,6 +69,13 @@ export const CHECK_RULES: Record<string, Rule> = {
 const VISIBILITY_SOURCE = 'https://github.com/AKzar1el/mcp-geo/blob/main/docs/ai-visibility-audit-methodology.md';
 // Fewer answers than this per report = a rate too noisy to act on without a rerun.
 export const MIN_ANSWERS = 20;
+// Fewer answers than this on one engine = that engine's rate is flagged in the evidence.
+export const MIN_ENGINE_ANSWERS = 10;
+// Stored answers older than this are not used: the weekly scan refreshes them.
+export const WINDOW_DAYS = 30;
+// Bots that fetch pages for AI answers and search. Blocking only the others
+// (CCBot, Bytespider, Google-Extended, anthropic-ai: training) is often deliberate.
+const ANSWER_BOTS = ['gptbot', 'oai-searchbot', 'chatgpt-user', 'claudebot', 'perplexitybot'];
 
 export type Action = {
   action_id: string;
@@ -95,7 +101,7 @@ export type Action = {
 
 type Draft = Omit<Action, 'action_id' | 'priority' | 'impact' | 'quick_win' | 'status'> & { reach: number };
 
-export type EngineVisibility = { engine: string; run_id: string; mentioned: number; answers: number; rate: number };
+export type EngineVisibility = { engine: string; runs: number; mentioned: number; answers: number; expected: number; rate: number };
 export type Visibility = {
   rate: number | null;
   mentioned: number;
@@ -116,17 +122,21 @@ function aeoDrafts(audit: Audit): Draft[] {
     const rule = CHECK_RULES[c.id];
     if (!rule || c.failingUrls.length === 0) continue;
     const robotsUnknown = c.id === 'ai-bot-access' && !!audit.robots.error;
+    const trainingOnly = c.id === 'ai-bot-access' && !robotsUnknown
+      && !audit.robots.aiBotBlocked.some((b) => ANSWER_BOTS.includes(b));
     const perPage = !['ai-bot-access', 'rss-feed'].includes(c.id);
     out.push({
       id: c.id, origin: 'aeo', category: rule.category,
       // A check that passes site-wide (80%+) still lists its failing pages, one level lower.
-      severity: robotsUnknown ? 'high' : c.passed ? lower(rule.severity) : rule.severity,
-      effort: rule.effort, title: rule.title, fix: rule.fix, source: rule.source,
+      severity: robotsUnknown ? 'high' : trainingOnly ? 'low' : c.passed ? lower(rule.severity) : rule.severity,
+      effort: rule.effort, source: rule.source,
+      title: trainingOnly ? 'Only AI training crawlers blocked in robots.txt' : rule.title,
+      fix: trainingOnly ? 'Answer and search bots are allowed. Keep the training-bot blocks if they are deliberate.' : rule.fix,
       count: c.failingUrls.length,
       evidence: perPage ? `${c.details} ${c.label} failed on ${c.failingUrls.length} of ${audit.crawledPages} crawled pages.` : c.details,
       heuristic: !!rule.heuristic,
       // noindex is often intended (login, basket): a person confirms which pages should be indexed.
-      to_verify: !!rule.heuristic || robotsUnknown || c.id === 'indexability',
+      to_verify: !!rule.heuristic || robotsUnknown || trainingOnly || c.id === 'indexability',
       urls: c.failingUrls,
       reach: perPage ? c.failingUrls.length / Math.max(1, audit.crawledPages) : 1,
     });
@@ -139,8 +149,10 @@ const lower = (s: Severity): Severity => (s === 'critical' ? 'high' : s === 'hig
 function visibilityDrafts({ visibility: v, losing, absent, promptCount }: VisibilitySummary): Draft[] {
   if (v.rate === null) return [];
   const out: Draft[] = [];
-  const to_verify = v.answers < MIN_ANSWERS;
-  const engines = v.per_engine.map((e) => `${e.engine} ${e.mentioned}/${e.answers}`).join(', ');
+  const to_verify = v.answers < MIN_ANSWERS || v.per_engine.some((e) => e.answers < MIN_ENGINE_ANSWERS);
+  const thin = v.per_engine.filter((e) => e.answers < MIN_ENGINE_ANSWERS || e.answers < e.expected);
+  const engines = v.per_engine.map((e) => `${e.engine} ${e.mentioned}/${e.answers}`).join(', ')
+    + (thin.length ? `; to verify: ${thin.map((e) => `${e.engine} answered ${e.answers} of ${e.expected} prompts`).join(', ')}` : '');
   const sample = `${v.answers} unbranded answers, ${v.runs} runs, ${v.window?.from.slice(0, 10)} to ${v.window?.to.slice(0, 10)}, market ${v.market}`;
   if (v.rate < 0.3 && absent.length > 0) {
     out.push({
@@ -172,7 +184,7 @@ function visibilityDrafts({ visibility: v, losing, absent, promptCount }: Visibi
 /** jev-seo rules: impact normalised to the top action = 100; P1 critical or high with impact 40+. */
 export function rankActions(drafts: Draft[]): Action[] {
   const raw = drafts.map((d) => SEVERITY_WEIGHT[d.severity] * (0.6 + 0.4 * d.reach));
-  const top = Math.max(1, ...raw);
+  const top = Math.max(0, ...raw) || 1;
   const ranked = drafts.map(({ reach: _reach, ...d }, i) => {
     const impact = Math.round((100 * raw[i]) / top);
     const priority: Action['priority'] = d.severity === 'critical' || (d.severity === 'high' && impact >= 40) ? 'P1'
@@ -184,45 +196,48 @@ export function rankActions(drafts: Draft[]): Action[] {
 }
 
 /**
- * Unbranded AI visibility from the latest completed run per engine in the
- * brand's current market. Prompts naming the brand are left out (they measure
- * recall, not discovery); runs started before an identity change are skipped.
+ * Unbranded AI visibility from stored answers in the brand's current market:
+ * the newest answer per engine and active prompt within WINDOW_DAYS, so a
+ * partial rerun only replaces the prompts it re-asked. Prompts naming the brand
+ * are left out (they measure recall, not discovery); runs started before an
+ * identity change are skipped.
  */
-export function summariseVisibility(brand: Brand, runs: { run_id: string; started_at: number; responses: PromptResponse[] }[]) {
+export function summariseVisibility(brand: Brand, rows: ComparisonEvidenceRow[], activePromptIds: Set<string>) {
   const market = brandMarket(brand);
   // Aliases count: 'Studio Koloru czy Dwie Siostry' names the brand without its full name.
-  const names = (text: string) => findTermSetMatchIndex(text, { domain: brand.domain, name: brand.name, aliases: brand.aliases, excludeTerms: [] }) !== -1;
+  const names = (text: string) => findTermSetMatchIndex(text, {
+    domain: brand.domain, name: brand.name, aliases: brand.aliases, excludeTerms: brand.exclude_terms,
+  }) !== -1;
   const branded = new Set<string>();
-  const latest = new Map<string, PromptResponse & { run_id: string }>(); // engine+prompt -> newest ok row
-  const usedRuns = new Set<string>();
-  for (const run of runs) {
-    if (brand.identity_changed_at && run.started_at < brand.identity_changed_at) continue;
-    for (const r of run.responses) {
-      if (r.status !== 'ok') continue;
-      if (names(r.prompt_text)) { branded.add(r.prompt_id); continue; }
-      const key = `${r.engine}\u0000${r.prompt_id}`;
-      const prev = latest.get(key);
-      if (!prev || r.captured_at > prev.captured_at) latest.set(key, { ...r, run_id: run.run_id });
-      usedRuns.add(run.run_id);
-    }
+  const unbranded = new Set<string>();
+  const latest = new Map<string, ComparisonEvidenceRow>(); // engine+prompt -> newest ok row
+  for (const r of rows) {
+    if (r.status !== 'ok' || !activePromptIds.has(r.prompt_id)) continue;
+    if (brand.identity_changed_at && (r.run_started_at ?? r.captured_at) < brand.identity_changed_at) continue;
+    if (names(r.prompt_text)) { branded.add(r.prompt_id); continue; }
+    unbranded.add(r.prompt_id);
+    const key = `${r.engine}\u0000${r.prompt_id}`;
+    const prev = latest.get(key);
+    if (!prev || r.captured_at > prev.captured_at) latest.set(key, r);
   }
-  const rows = [...latest.values()];
-  const per_engine: EngineVisibility[] = [...new Set(rows.map((r) => r.engine))].sort().map((engine) => {
-    const e = rows.filter((r) => r.engine === engine);
+  const used = [...latest.values()];
+  const per_engine: EngineVisibility[] = [...new Set(used.map((r) => r.engine))].sort().map((engine) => {
+    const e = used.filter((r) => r.engine === engine);
     const mentioned = e.filter((r) => r.brand_mentioned === 1).length;
-    return { engine, run_id: e[0].run_id, mentioned, answers: e.length, rate: Math.round((1000 * mentioned) / e.length) / 1000 };
+    return { engine, runs: new Set(e.map((r) => r.run_id)).size, mentioned, answers: e.length, expected: unbranded.size,
+      rate: Math.round((1000 * mentioned) / e.length) / 1000 };
   });
-  const mentioned = rows.filter((r) => r.brand_mentioned === 1).length;
-  const times = rows.map((r) => r.captured_at).sort((a, b) => a - b);
+  const mentioned = used.filter((r) => r.brand_mentioned === 1).length;
+  const times = used.map((r) => r.captured_at).sort((a, b) => a - b);
   const visibility: Visibility = {
-    rate: rows.length ? Math.round((1000 * mentioned) / rows.length) / 1000 : null,
-    mentioned, answers: rows.length, runs: usedRuns.size,
+    rate: used.length ? Math.round((1000 * mentioned) / used.length) / 1000 : null,
+    mentioned, answers: used.length, runs: new Set(used.map((r) => r.run_id)).size,
     window: times.length ? { from: new Date(times[0]).toISOString(), to: new Date(times[times.length - 1]).toISOString() } : null,
     market: market.market, google_domain: market.google_domain,
     branded_prompts_excluded: branded.size, per_engine,
   };
   const byPrompt = new Map<string, { prompt: string; hit: boolean; competitors: Set<string> }>();
-  for (const r of rows) {
+  for (const r of used) {
     const p = byPrompt.get(r.prompt_id) ?? { prompt: r.prompt_text, hit: false, competitors: new Set<string>() };
     if (r.brand_mentioned === 1) p.hit = true;
     else for (const c of r.competitors_mentioned) p.competitors.add(c);
@@ -251,7 +266,7 @@ export function buildGeoReport(brand: Brand, audit: Audit, vis: VisibilitySummar
         aeo: `16 deterministic checks on ${audit.crawledPages} crawled pages; a site-wide check passes when 80%+ of pages pass it; llms.txt weighs 0. Ranks work, not a traffic prediction. Content quality (6 dimensions) is scored by the calling model from pages_for_review, not here.`,
         ai_visibility: visibility.rate === null
           ? `Not assessed: no completed scan in market ${visibility.market}. Run refresh_brand, then rebuild the report.`
-          : `Share of unbranded answers that mention the brand: ${visibility.mentioned}/${visibility.answers}, latest completed run per engine (n = ${visibility.runs} runs), ${visibility.window!.from.slice(0, 10)} to ${visibility.window!.to.slice(0, 10)}, market ${visibility.market} (${visibility.google_domain}). ${visibility.branded_prompts_excluded} prompts naming the brand left out. A sample, not a ranking or traffic prediction.${visibility.answers < MIN_ANSWERS ? ` Under ${MIN_ANSWERS} answers: to verify with a rerun.` : ''}`,
+          : `Share of unbranded answers that mention the brand: ${visibility.mentioned}/${visibility.answers}, newest answer per engine and active prompt in the last ${WINDOW_DAYS} days (n = ${visibility.runs} runs), ${visibility.window!.from.slice(0, 10)} to ${visibility.window!.to.slice(0, 10)}, market ${visibility.market} (${visibility.google_domain}). ${visibility.branded_prompts_excluded} prompts naming the brand left out. A sample, not a ranking or traffic prediction.${visibility.answers < MIN_ANSWERS ? ` Under ${MIN_ANSWERS} answers: to verify with a rerun.` : ''}${visibility.per_engine.some((e) => e.answers < MIN_ENGINE_ANSWERS) ? ` An engine has under ${MIN_ENGINE_ANSWERS} answers: its rate is to verify.` : ''}`,
       },
       // Not combined into one overall: a site audit and sampled AI answers do not share a scale.
       overall: null,
@@ -262,13 +277,12 @@ export function buildGeoReport(brand: Brand, audit: Audit, vis: VisibilitySummar
   };
 }
 
-export async function collectRuns(db: Db, brandId: string) {
-  const out: { run_id: string; started_at: number; responses: PromptResponse[] }[] = [];
-  for (const engine of ALL_ENGINES) {
-    const run = await db.getLatestCompletedRun(brandId, engine);
-    if (run) out.push({ run_id: run.id, started_at: run.started_at, responses: await db.getResponsesForRun(run.id) });
-  }
-  return out;
+export async function collectVisibility(db: Db, brand: Brand, now = Date.now()) {
+  const [rows, active] = await Promise.all([
+    db.getResponsesSince(brand.id, now - WINDOW_DAYS * 86_400_000),
+    db.getActivePrompts(brand.id),
+  ]);
+  return summariseVisibility(brand, rows, new Set(active.map((p) => p.id)));
 }
 
 export function registerGeoReportTool(server: McpServer, db: Db, f: typeof fetch, version: string): void {
@@ -277,7 +291,7 @@ export function registerGeoReportTool(server: McpServer, db: Db, f: typeof fetch
     {
       title: 'GEO report (jev-seo model)',
       description:
-        "Build the GEO report for a tracked brand in the jev-seo report model: runs the AEO site audit and reads the latest stored AI visibility scan (no new engine calls). Returns scores with their method, AI visibility as a rate with n answers, runs, window and market, and GEO-### actions (priority, impact, effort, evidence, fix, source, to_verify). Example: brand_id='studiokoloru'.",
+        "Build the GEO report for a tracked brand in the jev-seo report model: runs the AEO site audit and reads stored AI answers from the last 30 days (no new engine calls). Returns scores with their method, AI visibility as a rate with n answers, runs, window and market, and GEO-### actions (priority, impact, effort, evidence, fix, source, to_verify). Example: brand_id='studiokoloru'.",
       inputSchema: {
         brand_id: z.string().describe('Tracked brand ID.'),
         max_pages: z.number().int().min(1).max(MAX_CRAWL_LIMIT).optional().describe('Pages to crawl, default 30.'),
@@ -287,8 +301,8 @@ export function registerGeoReportTool(server: McpServer, db: Db, f: typeof fetch
     async ({ brand_id, max_pages }) => {
       const brand = await db.getBrand(brand_id);
       if (!brand) throw new Error(`Unknown brand_id '${brand_id}'. Call list_brands for tracked IDs.`);
-      const [audit, runs] = await Promise.all([auditSite(f, brand.domain, max_pages ?? MAX_CRAWL_LIMIT), collectRuns(db, brand_id)]);
-      const payload = buildGeoReport(brand, audit, summariseVisibility(brand, runs), version);
+      const [audit, vis] = await Promise.all([auditSite(f, brand.domain, max_pages ?? MAX_CRAWL_LIMIT), collectVisibility(db, brand)]);
+      const payload = buildGeoReport(brand, audit, vis, version);
       return { content: [{ type: 'text' as const, text: JSON.stringify(payload, null, 2) }], structuredContent: payload };
     },
   );
