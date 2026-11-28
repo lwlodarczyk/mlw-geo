@@ -6,7 +6,7 @@ const env = { SEED_SECRET: 's3cret', SELF_URL: 'https://mlw-geo.example.workers.
 const req = (path: string, secret?: string) =>
   new Request(`https://anything.internal${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', ...(secret === undefined ? {} : { 'X-Seed-Secret': secret }) },
+    headers: { host: 'localhost:8788', 'content-type': 'application/json', ...(secret === undefined ? {} : { 'X-Seed-Secret': secret }) },
     body: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
   });
 
@@ -27,5 +27,6 @@ test('right secret becomes a /mcp request on the canonical host, body and header
   assert.equal(r.url, 'https://mlw-geo.example.workers.dev/mcp');
   assert.equal(r.headers.get('content-type'), 'application/json');
   assert.equal(r.headers.get('X-Seed-Secret'), null);
+  assert.equal(r.headers.get('host'), 'mlw-geo.example.workers.dev'); // the hosted handler checks Host against SELF_URL
   assert.equal(await r.text(), '{"jsonrpc":"2.0","id":1,"method":"tools/list"}');
 });

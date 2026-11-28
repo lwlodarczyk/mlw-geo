@@ -26,6 +26,8 @@ export function internalMcpRequest(request: Request, env: { SEED_SECRET?: string
   }
   const headers = new Headers(request.headers);
   headers.delete('X-Seed-Secret');
+  const target = new URL('/mcp', env.SELF_URL || url.origin);
+  headers.set('host', target.host); // the hosted handler checks Host against SELF_URL
   // duplex: Node needs it for a streamed body; Workers ignore it.
-  return new Request(new URL('/mcp', env.SELF_URL || url.origin), { method: request.method, headers, body: request.body, duplex: 'half' } as RequestInit);
+  return new Request(target, { method: request.method, headers, body: request.body, duplex: 'half' } as RequestInit);
 }
