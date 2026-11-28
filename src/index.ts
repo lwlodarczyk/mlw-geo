@@ -4,6 +4,7 @@
 // stdio CLI (src/cli.ts).
 
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
+import { internalMcpRequest, safeEquals } from './core/internal-mcp.js';
 import { env as workerEnv } from 'cloudflare:workers';
 import { McpAgent } from 'agents/mcp';
 import { createMcpHandler } from 'agents/mcp/server';
@@ -241,20 +242,6 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { 'content-type': 'application/json; charset=utf-8' },
   });
-}
-
-// Constant-time string comparison so the secret check doesn't leak
-// match-prefix length through response timing. (Length inequality still
-// short-circuits, which is fine — the length of a high-entropy secret
-// is not useful to an attacker.)
-function safeEquals(a: string, b: string): boolean {
-  const enc = new TextEncoder();
-  const ab = enc.encode(a);
-  const bb = enc.encode(b);
-  if (ab.length !== bb.length) return false;
-  let diff = 0;
-  for (let i = 0; i < ab.length; i++) diff |= ab[i] ^ bb[i];
-  return diff === 0;
 }
 
 function requireSeedSecret(request: Request, env: Env): Response | null {
@@ -986,7 +973,13 @@ export default {
     request: Request,
     env: Env,
     ctx: ExecutionContext,
-  ): Promise<Response> => oauthProvider.fetch(request, env, ctx),
+  ): Promise<Response> => {
+    // Worker-to-worker MCP (shoper-growth-mcp) skips OAuth behind the seed secret.
+    const internal = internalMcpRequest(request, env);
+    if (internal instanceof Response) return Promise.resolve(internal);
+    if (internal) return handleHostedMcpRequest(internal, env, ctx);
+    return oauthProvider.fetch(request, env, ctx);
+  },
   // Cloudflare Cron Trigger. wrangler.jsonc sets the schedule to every
   // 6 hours; this handler checks each brand against its refresh_frequency
   // and dispatches runEngines only for brands that are actually due.
